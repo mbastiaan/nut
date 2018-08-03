@@ -269,13 +269,7 @@ static int battery_voltage_nominal = 12,
 	/* input_voltage_maximum = -1,
 	   input_voltage_minimum = -1, */
 	   switchable_load_banks = 0,
-       unit_id = -1; /*!< range: 1-65535, most likely */
-
-
-static unsigned battery_charge_min = 100,
-       no_low_battery = 0,
-       shutdown_treshhold = 0,
-       battery_charge = 0;
+	   unit_id = -1; /*!< range: 0-65535, most likely */
 
 /*! Time in seconds to delay before shutting down. */
 static unsigned int offdelay = DEFAULT_OFFDELAY;
@@ -345,6 +339,35 @@ static int hex2d(const unsigned char *start, unsigned int len)
 	return strtol((char *)buf, NULL, 16);
 }
 
+/*!@brief Convert N characters from hex to ASCII
+ *
+ * @param[in] msg	Buffer to convert
+ * @param[in] len	Number of bytes to convert
+ *
+ * @return		Pointer to static buffer with decoded message
+ */
+static const char *hex2asc(const unsigned char *msg, size_t len)
+{
+	size_t i;
+	static unsigned char buf[256];
+	unsigned char *bufp, *end;
+
+	bufp = buf;
+	end = bufp + sizeof(buf);
+	buf[0] = 0;
+
+	for(i=0; i<len && end-bufp>0; i++) {
+		*bufp++ = toprint(msg[i]);
+	}
+
+	if (end-bufp > 0)
+		*bufp = '\0';
+	else
+		*--end='\0';
+
+	return (char *)buf;
+}
+
 /*!@brief Convert N characters from big-endian binary to decimal
  *
  * @param start		Beginning of string to convert
@@ -382,7 +405,7 @@ static int hex_or_bin2d(const unsigned char *start, unsigned int len)
  *
  * @return		Pointer to static buffer with decoded message
  */
-static const char *hexascdump(unsigned char *msg, size_t len)
+static const char *hexascdump(const unsigned char *msg, size_t len)
 {
 	size_t i;
 	static unsigned char buf[256];
@@ -437,6 +460,507 @@ enum tl_model_t decode_protocol(unsigned int proto)
 	}
 
 	return TRIPP_LITE_UNKNOWN;
+}
+
+void decode_proto(const unsigned char *value)
+{
+    unsigned int proto_number = 0;
+
+    /* - * - * - * - * - * - * - * - * - * - * - * - * - * - * - */
+    /* Decode value[1,2]*/
+
+	proto_number = ((unsigned)(value[1]) << 8) | (unsigned)(value[2]);
+	tl_model = decode_protocol(proto_number);
+
+	if(tl_model == TRIPP_LITE_UNKNOWN)
+		dstate_setinfo("ups.debug.0", "%s", hexascdump(value+1, 7));
+
+	dstate_setinfo("ups.firmware.aux", "protocol %04x", proto_number);
+
+    /* - * - * - * - * - * - * - * - * - * - * - * - * - * - * - */
+    /* End of decoding */
+	/* Comment next line to disable display of debug values */
+    dstate_setinfo("ups.debug.0", "%s", hexascdump(value+1, 7));
+}
+
+void decode_b(const unsigned char *value)
+{
+   	double bv_12V = 0.0; /*!< battery voltage, relative to a 12V battery */
+    int bp;
+
+    /* - * - * - * - * - * - * - * - * - * - * - * - * - * - * - */
+    /* Decode value[1,2,3,4] */
+    dstate_setinfo("input.voltage", "%.2f", hex2d(value+1, 4)/3600.0*input_voltage_scaled);
+
+	bv_12V = hex2d(value+5, 2)/16.0;
+
+	/* TODO: use battery_voltage_nominal, even though it is most likely 12V */
+	dstate_setinfo("battery.voltage", "%.2f", bv_12V);
+    /* - * - * - * - * - * - * - * - * - * - * - * - * - * - * - */
+    /* End of decoding */
+
+    /* Calculate battery.charge: */
+    /* dq ~= sqrt(dV) is a reasonable approximation
+    * Results fit well against the discrete function used in the Tripp Lite
+    * source, but give a continuous result. */
+    if (bv_12V >= V_interval[1]) {
+		bp = 100;
+    }
+	else if (bv_12V <= V_interval[0]) {
+		bp = 10;
+	}
+
+	else {
+		bp = (int)(100*sqrt((bv_12V - V_interval[0]) / (V_interval[1] - V_interval[0])));
+	}
+
+    dstate_setinfo("battery.charge",  "%3d", bp);
+
+    /* - * - * - * - * - * - * - * - * - * - * - * - * - * - * - */
+	/* Comment next line to disable display of debug values */
+    dstate_setinfo("ups.debug.B", "%s", hexascdump(value+1, 7));
+
+}
+
+void decode_d(const unsigned char *value)
+{
+    double battery_voltage; /*!< the total battery voltage */
+   	double bv_12V = 0.0; /*!< battery voltage, relative to a 12V battery */
+   	int input_voltage, bp;
+
+    /* - * - * - * - * - * - * - * - * - * - * - * - * - * - * - */
+    /* Decode value[1,2] */
+    if(tl_model == TRIPP_LITE_SMART_3005) {
+		input_voltage = hex_or_bin2d(value+1, 2);
+	} else {
+		input_voltage =  hex_or_bin2d(value+1, 2) * input_voltage_scaled / 120;
+	}
+
+    dstate_setinfo("input.voltage", "%d", input_voltage);
+
+    /* - * - * - * - * - * - * - * - * - * - * - * - * - * - * - */
+    /* Decode value[3,4] */
+    if(tl_model == TRIPP_LITE_SMART_3005) {
+		battery_voltage = hex_or_bin2d(value+3, 2) / 10.0 ;
+	} else {
+		/* TODO: factor out the two constants */
+		bv_12V = hex_or_bin2d(value+3, 2) / 10.0 ;
+		battery_voltage = bv_12V * battery_voltage_nominal / 12.0;
+	}
+
+	dstate_setinfo("battery.voltage", "%.2f", battery_voltage);
+
+    /* - * - * - * - * - * - * - * - * - * - * - * - * - * - * - */
+    /* End of decoding */
+
+    /* Calculate battery.charge based on battery voltage for models where not available: */
+    if( tl_model == TRIPP_LITE_SMARTPRO || tl_model == TRIPP_LITE_SMART_0004 ) {
+		/* dq ~= sqrt(dV) is a reasonable approximation
+		 * Results fit well against the discrete function used in the Tripp Lite
+		 * source, but give a continuous result. */
+        if (bv_12V >= V_interval[1]) {
+            bp = 100;
+        }
+        else if (bv_12V <= V_interval[0]) {
+            bp = 10;
+        }
+
+        else {
+            bp = (int)(100*sqrt((bv_12V - V_interval[0]) / (V_interval[1] - V_interval[0])));
+        }
+
+		dstate_setinfo("battery.charge",  "%3d", bp);
+	}
+
+	/* Comment next line to disable display of debug values */
+    dstate_setinfo("ups.debug.D", "%s", hexascdump(value+1, 7));
+}
+
+void decode_f(const unsigned char *value)
+{
+    /* - * - * - * - * - * - * - * - * - * - * - * - * - * - * - */
+    /* Decode value[1,2,3,4,5,6] */
+	dstate_setinfo("ups.firmware", "F%s", hex2asc(value+1, 6));
+
+    /* - * - * - * - * - * - * - * - * - * - * - * - * - * - * - */
+    /* End of decoding */
+	/* Comment next line to disable display of debug values */
+    dstate_setinfo("ups.debug.F", "%s", hexascdump(value+1, 7));
+}
+
+void decode_l(const unsigned char *value)
+{
+    /* - * - * - * - * - * - * - * - * - * - * - * - * - * - * - */
+    /* Decode value */
+    switch(tl_model) {
+		case TRIPP_LITE_OMNIVS:
+		case TRIPP_LITE_OMNIVS_2001:
+			dstate_setinfo("output.voltage", "%.1f", hex2d(value+1, 4)/240.0*input_voltage_scaled);
+			break;
+		case TRIPP_LITE_SMARTPRO:
+			dstate_setinfo("ups.load", "%d", hex2d(value+1, 2));
+			break;
+		case TRIPP_LITE_SMART_0004:
+			dstate_setinfo("ups.load", "%d", hex2d(value+1, 2));
+			break;
+		default:
+			break;
+    }
+
+    /* - * - * - * - * - * - * - * - * - * - * - * - * - * - * - */
+    /* End of decoding */
+	/* Comment next line to disable display of debug values */
+    dstate_setinfo("ups.debug.L","%s", hexascdump(value+1, 7));
+}
+
+void decode_m(const unsigned char *value)
+{
+   	int input_voltage_minimum, input_voltage_maximum;
+
+    /* - * - * - * - * - * - * - * - * - * - * - * - * - * - * - */
+    /* Decode value[1,2] */
+    if(tl_model == TRIPP_LITE_SMART_3005) {
+        input_voltage_minimum = hex_or_bin2d(value+1, 2);
+        input_voltage_maximum = hex_or_bin2d(value+3, 2);
+	} else {
+        input_voltage_minimum = hex_or_bin2d(value+1, 2) * input_voltage_scaled / 120;
+        input_voltage_maximum = hex_or_bin2d(value+3, 2) * input_voltage_scaled / 120;
+	}
+
+	dstate_setinfo("input.voltage.minimum", "%3d", input_voltage_minimum);
+	dstate_setinfo("input.voltage.maximum", "%3d", input_voltage_maximum);
+
+    /* - * - * - * - * - * - * - * - * - * - * - * - * - * - * - */
+    /* End of decoding */
+	/* Comment next line to disable display of debug values */
+    dstate_setinfo("ups.debug.M", "%s", hexascdump(value+1, 7));
+}
+
+void decode_p(const unsigned char *value)
+{
+	int  va;
+
+    /* - * - * - * - * - * - * - * - * - * - * - * - * - * - * - */
+    /* Decode value[1,2,3,4,5,6,7] */
+	va = strtol((char *)(value+1), NULL, 10);
+
+	if(tl_model == TRIPP_LITE_SMART_0004) {
+		va *= 10; /* TODO: confirm? */
+	}
+
+    dstate_setinfo("ups.power.nominal", "%d", va);
+
+    /* - * - * - * - * - * - * - * - * - * - * - * - * - * - * - */
+    /* End of decoding */
+	/* Comment next line to disable display of debug values */
+    dstate_setinfo("ups.debug.P","%s", hexascdump(value+1, 7));
+}
+
+void decode_s(const unsigned char *value)
+{
+	unsigned int s_value_1;
+
+    /* - * - * - * - * - * - * - * - * - * - * - * - * - * - * - */
+    /* Decode value[1] */
+
+    s_value_1 = value[1];
+	if(is_binary_protocol()) {
+		s_value_1 += '0';
+	}
+
+	switch(s_value_1) {
+		case '0':
+			status_set("LB");
+			break;
+		case '1': /* Depends on s_value[2] */
+			break;
+		case '2':
+			if( tl_model == TRIPP_LITE_SMARTPRO ) {
+				status_set("RB");
+				break;
+			} /* else fall through: */
+		default:
+			upslogx(LOG_ERR, "Unknown value for s[1]: 0x%02x", value[1]);
+			dstate_datastale();
+			break;
+	}
+
+    /* - * - * - * - * - * - * - * - * - * - * - * - * - * - * - */
+    /* Decode value[2] */
+
+	if(tl_model == TRIPP_LITE_OMNIVS) {
+		switch(value[2]) {
+			case '0':
+				status_set("OL");
+				break;
+			case '1':
+				status_set("OB");
+				break;
+			case '2':
+				/* "charge-only" mode, no AC in or out... the PC
+				 * shouldn't see this, because there is no power in
+				 * that case (OMNIVS), but it's here for testing.
+				 *
+				 * Entered by holding down the power button.
+				 */
+				status_set("BYPASS");
+				break;
+			case '3':
+				/* I have seen this once when switching from off+LB to charging */
+				upslogx(LOG_WARNING, "Unknown value for s[2]: 0x%02x", value[2]);
+				break;
+			default:
+				upslogx(LOG_ERR, "Unknown value for s[2]: 0x%02x", value[2]);
+				dstate_datastale();
+				break;
+		}
+	}
+
+	if(is_smart_protocol() || tl_model == TRIPP_LITE_OMNIVS_2001) {
+
+		unsigned int s_value_2 = value[2];
+
+		if(is_binary_protocol()) {
+			s_value_2 += '0';
+		}
+		switch(s_value_2) {
+			case '0':
+				dstate_setinfo("battery.test.status", "Battery OK");
+				break;
+			case '1':
+				dstate_setinfo("battery.test.status", "Battery bad - replace");
+				break;
+			case '2':
+				status_set("CAL");
+				break;
+			case '3':
+				status_set("OVER");
+				dstate_setinfo("battery.test.status", "Overcurrent?");
+				break;
+			case '4':
+				/* The following message is confusing, and may not be accurate: */
+				/* dstate_setinfo("battery.test.status", "Battery state unknown"); */
+				break;
+			case '5':
+				status_set("OVER");
+				dstate_setinfo("battery.test.status", "Battery fail - overcurrent?");
+				break;
+			default:
+				upslogx(LOG_ERR, "Unknown value for s[2]: 0x%02x", value[2]);
+				dstate_datastale();
+				break;
+		}
+	}
+    /* - * - * - * - * - * - * - * - * - * - * - * - * - * - * - */
+    /* Decode value[4] */
+
+    if(is_smart_protocol() || tl_model == TRIPP_LITE_OMNIVS_2001) {
+
+		if(value[4] & 4) {
+			status_set("OFF");
+		} else {
+			/* Online/on battery: */
+			if(value[4] & 1) {
+				status_set("OB");
+			} else {
+				status_set("OL");
+			}
+		}
+    }
+
+    /* - * - * - * - * - * - * - * - * - * - * - * - * - * - * - */
+    /* Decode value[5] */
+
+#if 0
+		/* Apparently, this value changes more frequently when the
+		 * battery is discharged, but it does not track the actual
+		 * state-of-charge. See battery.charge calculation below.
+		 */
+		if(tl_model == TRIPP_LITE_SMARTPRO) {
+			unsigned battery_charge;
+			battery_charge = (unsigned)(s_value[5]);
+			dstate_setinfo("battery.charge",  "%u", battery_charge);
+		}
+#endif
+
+    /* - * - * - * - * - * - * - * - * - * - * - * - * - * - * - */
+    /* End of decoding */
+	/* Comment next line to disable display of debug values */
+    dstate_setinfo("ups.debug.S","%s", hexascdump(value+1, 7));
+
+}
+
+void decode_t(const unsigned char *value)
+{
+   	int freq;
+
+    /* - * - * - * - * - * - * - * - * - * - * - * - * - * - * - */
+    /* Decode value[1] */
+    if( tl_model == TRIPP_LITE_SMART_3005 ) {
+		dstate_setinfo("ups.temperature", "%d", (unsigned)(hex2d(value+1, 1)));
+	} else {
+		/* I'm guessing this is a calibration constant of some sort. */
+		dstate_setinfo("ups.temperature", "%.1f", (unsigned)(hex2d(value+1, 2)) * 0.3636 - 21);
+	}
+
+    /* - * - * - * - * - * - * - * - * - * - * - * - * - * - * - */
+    /* Decode value[3,4] */
+    if( tl_model == TRIPP_LITE_SMARTPRO ) {
+		freq = hex2d(value + 3, 3);
+		dstate_setinfo("input.frequency", "%.1f", freq / 10.0);
+    }
+
+    /* - * - * - * - * - * - * - * - * - * - * - * - * - * - * - */
+    /* Decode value[6] */
+    if( tl_model == TRIPP_LITE_SMARTPRO ) {
+        switch(value[6]) {
+            case '0':
+				dstate_setinfo("input.frequency.nominal", "%d", 50);
+				break;
+			case '1':
+				dstate_setinfo("input.frequency.nominal", "%d", 60);
+				break;
+		}
+    }
+
+    if( tl_model == TRIPP_LITE_SMART_0004 ) {
+        freq = hex2d(value + 3, 4);
+		dstate_setinfo("input.frequency", "%.1f", freq / 10.0);
+    }
+
+
+    /* - * - * - * - * - * - * - * - * - * - * - * - * - * - * - */
+    /* End of decoding */
+	/* Comment next line to disable display of debug values */
+    dstate_setinfo("ups.debug.T","%s", hexascdump(value+1, 7));
+}
+
+void decode_u(const unsigned char *value)
+{
+    /* - * - * - * - * - * - * - * - * - * - * - * - * - * - * - */
+    /* Decode value[1,2] */
+
+    unit_id = (int)((unsigned)(value[1]) << 8) | (unsigned)(value[2]);
+
+    if(unit_id >= 0) {
+		dstate_setinfo("ups.id", "%d", unit_id);
+		dstate_setflags("ups.id", ST_FLAG_RW | ST_FLAG_STRING);
+		dstate_setaux("ups.id", 5);
+		upslogx(LOG_DEBUG,"Unit ID: %d", unit_id);
+	}
+
+    /* - * - * - * - * - * - * - * - * - * - * - * - * - * - * - */
+    /* End of decoding */
+	/* Comment next line to disable display of debug values */
+    dstate_setinfo("ups.debug.U","%s", hexascdump(value+1, 7));
+}
+
+void decode_v(const unsigned char *value)
+{
+	unsigned char ivn, lb;
+	int bv;
+
+    /* - * - * - * - * - * - * - * - * - * - * - * - * - * - * - */
+    /* Decode value[1] */
+
+    ivn = value[1];
+
+    switch(ivn) {
+		case 0:   input_voltage_nominal =
+			  input_voltage_scaled  = 100;
+			  break;
+
+		/* protocol 3005 */
+		case 1:   input_voltage_nominal =
+			  input_voltage_scaled  = 120;
+			  break;
+
+		case 2:   input_voltage_nominal =
+			  input_voltage_scaled  = 230;
+			  break;
+
+		case 3:   input_voltage_nominal = 208;
+			  input_voltage_scaled  = 230;
+			  break;
+
+		case 6:   input_voltage_nominal =
+			  input_voltage_scaled  = 230;
+			  break;
+
+		default:
+			  upslogx(2, "Unknown input voltage range: 0x%02x", (unsigned int)ivn);
+			  break;
+	}
+
+    dstate_setinfo("input.voltage.nominal", "%d", input_voltage_nominal);
+
+    /* - * - * - * - * - * - * - * - * - * - * - * - * - * - * - */
+    /* Decode value[2,3] */
+
+	if(is_binary_protocol()) {
+		/* 0x00 0x0c -> 12V ? */
+		battery_voltage_nominal = (value[2] << 8) | value[3];
+	} else {
+		bv = hex2d(value+2, 2);
+		battery_voltage_nominal = bv * 6;
+	}
+
+    dstate_setinfo("battery.voltage.nominal", "%d", battery_voltage_nominal);
+
+    /* - * - * - * - * - * - * - * - * - * - * - * - * - * - * - */
+    /* Decode value[4] */
+
+	lb = value[4];
+
+	if( (lb >= '0') && (lb <= '9') ) {
+		switchable_load_banks = lb - '0';
+	} else {
+		if(is_binary_protocol()) {
+			switchable_load_banks = lb;
+		} else {
+			if( lb != 'X' ) {
+				upslogx(2, "Unknown number of switchable load banks: 0x%02x", (unsigned int)lb);
+			}
+		}
+	}
+	upsdebugx(2, "Switchable load banks: %d", switchable_load_banks);
+
+	if(switchable_load_banks > 0) {
+		int i;
+		char outlet_name[80];
+
+		for(i = 1; i <= switchable_load_banks + 1; i++) {
+			snprintf(outlet_name, sizeof(outlet_name), "outlet.%d.id", i);
+			dstate_setinfo(outlet_name, "%d", i);
+
+			snprintf(outlet_name, sizeof(outlet_name), "outlet.%d.desc", i);
+			dstate_setinfo(outlet_name, "Load %d", i);
+
+			snprintf(outlet_name, sizeof(outlet_name), "outlet.%d.switchable", i);
+			if( i <= switchable_load_banks ) {
+				dstate_setinfo(outlet_name, "1");
+				snprintf(outlet_name, sizeof(outlet_name)-1, "outlet.%d.switch", i);
+				dstate_setinfo(outlet_name, "1");
+				dstate_setflags(outlet_name, ST_FLAG_RW | ST_FLAG_STRING);
+				dstate_setaux(outlet_name, 3);
+			} else {
+				/* Last bank is not switchable: */
+				dstate_setinfo(outlet_name, "0");
+			}
+
+		}
+
+		/* For the main relay: */
+		dstate_addcmd("load.on");
+		dstate_addcmd("load.off");
+	}
+
+	dstate_setinfo("ups.debug.load_banks", "%d", switchable_load_banks);
+
+    /* - * - * - * - * - * - * - * - * - * - * - * - * - * - * - */
+    /* End of decoding */
+	/* Comment next line to disable display of debug values */
+    dstate_setinfo("ups.debug.V","%s", hexascdump(value+1, 7));
 }
 
 void upsdrv_initinfo(void);
@@ -834,24 +1358,17 @@ void upsdrv_initinfo(void)
 	char *model, *model_end;
 	unsigned char proto_value[9], f_value[9], p_value[9], s_value[9],
 	     u_value[9], v_value[9], w_value[9];
-	int  va, ret, bv;
-	unsigned int proto_number = 0;
-	unsigned char ivn, lb;
+	int  ret;
+
+	/* - * - * - * - * - * - * - * - * - * - * - * - * - * - * - */
 
 	/* Read protocol: */
 	ret = send_cmd(proto_msg, sizeof(proto_msg), proto_value, sizeof(proto_value)-1);
 	if(ret <= 0) {
 		fatalx(EXIT_FAILURE, "Error reading protocol");
+	} else {
+        decode_proto(proto_value);
 	}
-
-	proto_number = ((unsigned)(proto_value[1]) << 8)
-			          | (unsigned)(proto_value[2]);
-	tl_model = decode_protocol(proto_number);
-
-	if(tl_model == TRIPP_LITE_UNKNOWN)
-		dstate_setinfo("ups.debug.0", "%s", hexascdump(proto_value+1, 7));
-
-	dstate_setinfo("ups.firmware.aux", "protocol %04x", proto_number);
 
 	/* - * - * - * - * - * - * - * - * - * - * - * - * - * - * - */
 
@@ -872,13 +1389,50 @@ void upsdrv_initinfo(void)
 
 	/* - * - * - * - * - * - * - * - * - * - * - * - * - * - * - */
 
+    /* Fetch firmware version: */
+	ret = send_cmd(f_msg, sizeof(f_msg), f_value, sizeof(f_value)-1);
+
+	decode_f(f_value);
+
+	/* - * - * - * - * - * - * - * - * - * - * - * - * - * - * - */
+
+	/* Get nominal power: */
+	ret = send_cmd(p_msg, sizeof(p_msg), p_value, sizeof(p_value)-1);
+
+	decode_p(p_value);
+
+	/* - * - * - * - * - * - * - * - * - * - * - * - * - * - * - */
+
+    /* Check retrieval of status: */
 	ret = send_cmd(s_msg, sizeof(s_msg), s_value, sizeof(s_value)-1);
 	if(ret <= 0) {
 		fatalx(EXIT_FAILURE, "Could not retrieve status ... is this an OMNIVS model?");
 	}
 
+    /* - * - * - * - * - * - * - * - * - * - * - * - * - * - * - */
+
+    /* Get Unit ID: */
+	if(tl_model != TRIPP_LITE_OMNIVS && tl_model != TRIPP_LITE_SMART_0004) {
+		/* Unit ID might not be supported by all models: */
+		ret = send_cmd(u_msg, sizeof(u_msg), u_value, sizeof(u_value)-1);
+		if(ret <= 0) {
+			upslogx(LOG_INFO, "Unit ID not retrieved (not available on all models)");
+		} else {
+            decode_u(u_value);
+		}
+	}
+
 	/* - * - * - * - * - * - * - * - * - * - * - * - * - * - * - */
 
+	/* Get configuration: */
+	ret = send_cmd(v_msg, sizeof(v_msg), v_value, sizeof(v_value)-1);
+
+	decode_v(v_value);
+
+	/* End of decoding */
+    /* - * - * - * - * - * - * - * - * - * - * - * - * - * - * - */
+
+    /* Set manufacturer and model */
 	dstate_setinfo("ups.mfr", "%s", "Tripp Lite");
 
 	/* trim "TRIPP LITE" from beginning of model */
@@ -900,153 +1454,6 @@ void upsdrv_initinfo(void)
 	dstate_setinfo("ups.model", "%s", model);
 
 	/* - * - * - * - * - * - * - * - * - * - * - * - * - * - * - */
-
-    /* Get nominal power: */
-	ret = send_cmd(p_msg, sizeof(p_msg), p_value, sizeof(p_value)-1);
-
-	va = strtol((char *)(p_value+1), NULL, 10);
-
-	if(tl_model == TRIPP_LITE_SMART_0004) {
-		dstate_setinfo("ups.debug.P","%s", hexascdump(p_value+1, 7));
-		va *= 10; /* TODO: confirm? */
-	}
-
-	dstate_setinfo("ups.power.nominal", "%d", va);
-
-	/* - * - * - * - * - * - * - * - * - * - * - * - * - * - * - */
-
-    /* Fetch firmware version: */
-	ret = send_cmd(f_msg, sizeof(f_msg), f_value, sizeof(f_value)-1);
-
-	toprint_str((char *)(f_value+1), 6);
-	f_value[7] = 0;
-
-	dstate_setinfo("ups.firmware", "F%s", f_value+1);
-
-	/* - * - * - * - * - * - * - * - * - * - * - * - * - * - * - */
-
-	/* Get configuration: */
-
-	ret = send_cmd(v_msg, sizeof(v_msg), v_value, sizeof(v_value)-1);
-
-	if(is_binary_protocol()) {
-		/* 0x00 0x0c -> 12V ? */
-		battery_voltage_nominal = (v_value[2] << 8) | v_value[3];
-	} else {
-		bv = hex2d(v_value+2, 2);
-		battery_voltage_nominal = bv * 6;
-	}
-
-    ivn = v_value[1];
-	lb = v_value[4];
-
-    switch(ivn) {
-		case 0:   input_voltage_nominal =
-			  input_voltage_scaled  = 100;
-			  break;
-
-		/* protocol 3005 */
-		case 1:   input_voltage_nominal =
-			  input_voltage_scaled  = 120;
-			  break;
-
-		case 2:   input_voltage_nominal =
-			  input_voltage_scaled  = 230;
-			  break;
-
-		case 3:   input_voltage_nominal = 208;
-			  input_voltage_scaled  = 230;
-			  break;
-
-		case 6:   input_voltage_nominal =
-			  input_voltage_scaled  = 230;
-			  break;
-
-		default:
-			  upslogx(2, "Unknown input voltage range: 0x%02x", (unsigned int)ivn);
-			  break;
-	}
-
-    if( (lb >= '0') && (lb <= '9') ) {
-		switchable_load_banks = lb - '0';
-	} else {
-		if(is_binary_protocol()) {
-			switchable_load_banks = lb;
-		} else {
-			if( lb != 'X' ) {
-				upslogx(2, "Unknown number of switchable load banks: 0x%02x",
-					(unsigned int)lb);
-			}
-		}
-	}
-	upsdebugx(2, "Switchable load banks: %d", switchable_load_banks);
-
-	/* FIXME: redundant, but since it's static, we don't need to poll
-	 * every time.
-	 */
-	debug_message("V", 2);
-
-    /* - * - * - * - * - * - * - * - * - * - * - * - * - * - * - */
-
-	if(switchable_load_banks > 0) {
-		int i;
-		char outlet_name[80];
-
-		for(i = 1; i <= switchable_load_banks + 1; i++) {
-			snprintf(outlet_name, sizeof(outlet_name), "outlet.%d.id", i);
-			dstate_setinfo(outlet_name, "%d", i);
-
-			snprintf(outlet_name, sizeof(outlet_name), "outlet.%d.desc", i);
-			dstate_setinfo(outlet_name, "Load %d", i);
-
-			snprintf(outlet_name, sizeof(outlet_name), "outlet.%d.switchable", i);
-			if( i <= switchable_load_banks ) {
-				dstate_setinfo(outlet_name, "1");
-				snprintf(outlet_name, sizeof(outlet_name)-1, "outlet.%d.switch", i);
-				dstate_setinfo(outlet_name, "1");
-				dstate_setflags(outlet_name, ST_FLAG_RW | ST_FLAG_STRING);
-				dstate_setaux(outlet_name, 3);
-			} else {
-				/* Last bank is not switchable: */
-				dstate_setinfo(outlet_name, "0");
-			}
-
-		}
-
-		/* For the main relay: */
-		dstate_addcmd("load.on");
-		dstate_addcmd("load.off");
-	}
-
-	/* - * - * - * - * - * - * - * - * - * - * - * - * - * - * - */
-
-	if(tl_model != TRIPP_LITE_OMNIVS && tl_model != TRIPP_LITE_SMART_0004) {
-		/* Unit ID might not be supported by all models: */
-		ret = send_cmd(u_msg, sizeof(u_msg), u_value, sizeof(u_value)-1);
-		if(ret <= 0) {
-			upslogx(LOG_INFO, "Unit ID not retrieved (not available on all models)");
-		} else {
-			unit_id = (int)((unsigned)(u_value[1]) << 8)
-				| (unsigned)(u_value[2]);
-		}
-
-		if(tl_model == TRIPP_LITE_SMART_0004) {
-			debug_message("U", 2);
-		}
-	}
-
-	if(unit_id >= 0) {
-		dstate_setinfo("ups.id", "%d", unit_id);
-		dstate_setflags("ups.id", ST_FLAG_RW | ST_FLAG_STRING);
-		dstate_setaux("ups.id", 5);
-		upslogx(LOG_DEBUG,"Unit ID: %d", unit_id);
-	}
-
-	/* - * - * - * - * - * - * - * - * - * - * - * - * - * - * - */
-
-	dstate_setinfo("input.voltage.nominal", "%d", input_voltage_nominal);
-	dstate_setinfo("battery.voltage.nominal", "%d", battery_voltage_nominal);
-	dstate_setinfo("ups.debug.load_banks", "%d", switchable_load_banks);
 
 	dstate_setinfo("ups.delay.shutdown", "%d", offdelay);
 	dstate_setflags("ups.delay.shutdown", ST_FLAG_RW | ST_FLAG_STRING);
@@ -1096,19 +1503,65 @@ void upsdrv_shutdown(void)
 void upsdrv_updateinfo(void)
 {
 	unsigned char b_msg[] = "B", d_msg[] = "D", l_msg[] = "L",
-			m_msg[] = "M", s_msg[] = "S", t_msg[] = "T";
-	unsigned char b_value[9], d_value[9], l_value[9], m_value[9],
-			s_value[9], t_value[9];
-	int bp, freq;
-	double bv_12V = 0.0; /*!< battery voltage, relative to a 12V battery */
-	double battery_voltage; /*!< the total battery voltage */
-
-	unsigned int s_value_1;
-
+			s_msg[] = "S", m_msg[] = "M", t_msg[] = "T";
+	unsigned char b_value[9], d_value[9], l_value[9], s_value[9],
+			m_value[9], t_value[9];
 	int ret;
 
 	status_init();
 
+	/* - * - * - * - * - * - * - * - * - * - * - * - * - * - * - */
+
+    /* Get input voltage and battery voltage for OMNIVS */
+	if( tl_model == TRIPP_LITE_OMNIVS || tl_model == TRIPP_LITE_OMNIVS_2001 ) {
+		ret = send_cmd(b_msg, sizeof(b_msg), b_value, sizeof(b_value));
+		if(ret <= 0) {
+			dstate_datastale();
+			usb_comm_fail(ret, "Error reading B value");
+			return;
+		}
+        decode_b(b_value);
+	}
+
+	/* - * - * - * - * - * - * - * - * - * - * - * - * - * - * - */
+
+    /* Get input voltage and battery voltage for SMART */
+	if( is_smart_protocol() ) {
+
+		ret = send_cmd(d_msg, sizeof(d_msg), d_value, sizeof(d_value));
+		if(ret <= 0) {
+			dstate_datastale();
+			usb_comm_fail(ret, "Error reading D value");
+			return;
+		}
+
+		decode_d(d_value);
+	}
+
+	/* - * - * - * - * - * - * - * - * - * - * - * - * - * - * - */
+
+    /* Get Load % */
+	ret = send_cmd(l_msg, sizeof(l_msg), l_value, sizeof(l_value));
+	if(ret <= 0) {
+		dstate_datastale();
+		usb_comm_fail(ret, "Error reading L value");
+		return;
+	}
+
+	decode_l(l_value);
+	/* - * - * - * - * - * - * - * - * - * - * - * - * - * - * - */
+
+    /* Input voltage minimum and maximum for SMART */
+	if( is_smart_protocol() ) {
+		ret = send_cmd(m_msg, sizeof(m_msg), m_value, sizeof(m_value));
+		if(ret <= 0) {
+			dstate_datastale();
+			usb_comm_fail(ret, "Error reading M (min/max input voltage)");
+			return;
+		}
+
+		decode_m(m_value);
+	}
 	/* - * - * - * - * - * - * - * - * - * - * - * - * - * - * - */
 
 	/* General status (e.g. "S10") */
@@ -1119,303 +1572,25 @@ void upsdrv_updateinfo(void)
 		return;
 	}
 
-	if(tl_model != TRIPP_LITE_OMNIVS && tl_model != TRIPP_LITE_OMNIVS_2001) {
-		dstate_setinfo("ups.debug.S","%s", hexascdump(s_value+1, 7));
-	}
+	decode_s(s_value);
 
-	/* - * - * - * - * - * - * - * - * - * - * - * - * - * - * - */
+    /* - * - * - * - * - * - * - * - * - * - * - * - * - * - * - */
 
-	if(tl_model == TRIPP_LITE_OMNIVS) {
-		switch(s_value[2]) {
-			case '0':
-				status_set("OL");
-				break;
-			case '1':
-				status_set("OB");
-				break;
-			case '2':
-				/* "charge-only" mode, no AC in or out... the PC
-				 * shouldn't see this, because there is no power in
-				 * that case (OMNIVS), but it's here for testing.
-				 *
-				 * Entered by holding down the power button.
-				 */
-				status_set("BYPASS");
-				break;
-			case '3':
-				/* I have seen this once when switching from off+LB to charging */
-				upslogx(LOG_WARNING, "Unknown value for s[2]: 0x%02x", s_value[2]);
-				break;
-			default:
-				upslogx(LOG_ERR, "Unknown value for s[2]: 0x%02x", s_value[2]);
-				dstate_datastale();
-				break;
-		}
-	}
-
-	/* - * - * - * - * - * - * - * - * - * - * - * - * - * - * - */
-
-	if(is_smart_protocol() || tl_model == TRIPP_LITE_OMNIVS_2001) {
-
-		unsigned int s_value_2 = s_value[2];
-
-		if(is_binary_protocol()) {
-			s_value_2 += '0';
-		}
-		switch(s_value_2) {
-			case '0':
-				dstate_setinfo("battery.test.status", "Battery OK");
-				break;
-			case '1':
-				dstate_setinfo("battery.test.status", "Battery bad - replace");
-				break;
-			case '2':
-				status_set("CAL");
-				break;
-			case '3':
-				status_set("OVER");
-				dstate_setinfo("battery.test.status", "Overcurrent?");
-				break;
-			case '4':
-				/* The following message is confusing, and may not be accurate: */
-				/* dstate_setinfo("battery.test.status", "Battery state unknown"); */
-				dstate_setinfo("battery.test.status", "Battery not tested");
-				break;
-			case '5':
-				status_set("OVER");
-				dstate_setinfo("battery.test.status", "Battery fail - overcurrent?");
-				break;
-			default:
-				upslogx(LOG_ERR, "Unknown value for s[2]: 0x%02x", s_value[2]);
-				dstate_datastale();
-				break;
-		}
-
-
-		if(s_value[4] & 4) {
-			status_set("OFF");
-		} else {
-			/* Online/on battery: */
-			if(s_value[4] & 1) {
-				status_set("OB");
-			} else {
-				status_set("OL");
-			}
-		}
-
-		if(tl_model == TRIPP_LITE_SMART_3005) {
-            unsigned bc_value = 0;
-
-            if (s_value[4] & 1){ //battery charge value is unstable, track lowest value
-                bc_value = (unsigned)(s_value[5]);
-                if (bc_value < battery_charge) {
-                    battery_charge = bc_value;
-                }
-            } else {
-                battery_charge_min = 100; //reset lowest measured battery charge
-                battery_charge = (unsigned)(s_value[5]);
-            }
-            dstate_setinfo("battery.charge",  "%u", battery_charge);
-		}
-#if 0
-		/* Apparently, this value changes more frequently when the
-		 * battery is discharged, but it does not track the actual
-		 * state-of-charge. See battery.charge calculation below.
-		 */
-		if(tl_model == TRIPP_LITE_SMARTPRO) {
-			unsigned battery_charge;
-			battery_charge = (unsigned)(s_value[5]);
-			dstate_setinfo("battery.charge",  "%u", battery_charge);
-		}
-#endif
-	}
-
-	/* - * - * - * - * - * - * - * - * - * - * - * - * - * - * - */
-
-	s_value_1 = s_value[1];
-	if(is_binary_protocol()) {
-		s_value_1 += '0';
-	}
-
-	switch(s_value_1) {
-		case '0':
-			status_set("LB");
-			break;
-		case '1': /* Depends on s_value[2] */
-			break;
-		case '2':
-			if( tl_model == TRIPP_LITE_SMARTPRO ) {
-				status_set("RB");
-				break;
-			} /* else fall through: */
-		default:
-			upslogx(LOG_ERR, "Unknown value for s[1]: 0x%02x", s_value[1]);
-			dstate_datastale();
-			break;
-	}
-
-	//Overruling of logic above in case of missing case '0' support on UPS
-	if (s_value[4] & 1 && no_low_battery && battery_charge < shutdown_treshhold) {
-        status_set("LB");
-	}
-
-	status_commit();
-
-	/* - * - * - * - * - * - * - * - * - * - * - * - * - * - * - */
-
-	if( tl_model == TRIPP_LITE_OMNIVS || tl_model == TRIPP_LITE_OMNIVS_2001 ) {
-		ret = send_cmd(b_msg, sizeof(b_msg), b_value, sizeof(b_value));
-		if(ret <= 0) {
-			dstate_datastale();
-			usb_comm_fail(ret, "Error reading B value");
-			return;
-		}
-
-		dstate_setinfo("input.voltage", "%.2f", hex2d(b_value+1, 4)/3600.0*input_voltage_scaled);
-
-		bv_12V = hex2d(b_value+5, 2)/16.0;
-
-		/* TODO: use battery_voltage_nominal, even though it is most likely 12V */
-		dstate_setinfo("battery.voltage", "%.2f", bv_12V);
-	}
-
-	/* - * - * - * - * - * - * - * - * - * - * - * - * - * - * - */
-
-	if( is_smart_protocol() ) {
-
-		ret = send_cmd(d_msg, sizeof(d_msg), d_value, sizeof(d_value));
-		if(ret <= 0) {
-			dstate_datastale();
-			usb_comm_fail(ret, "Error reading D value");
-			return;
-		}
-
-		dstate_setinfo("input.voltage", "%d",
-				hex_or_bin2d(d_value+1, 2));
-
-		/* TODO: factor out the two constants */
-		battery_voltage = hex_or_bin2d(d_value+3, 2) / 10.0 ;
-
-		dstate_setinfo("battery.voltage", "%.2f", battery_voltage);
-
-		/* - * - * - * - * - * - * - * - * - * - * - * - * - * - * - */
-
-		ret = send_cmd(m_msg, sizeof(m_msg), m_value, sizeof(m_value));
-
-                if(m_value[5] != 0x0d) { /* we only expect 4 hex/binary digits */
-			dstate_setinfo("ups.debug.M", "%s", hexascdump(m_value+1, 7));
-		}
-
-		if(ret <= 0) {
-			dstate_datastale();
-			usb_comm_fail(ret, "Error reading M (min/max input voltage)");
-			return;
-		}
-
-		dstate_setinfo("input.voltage.minimum", "%3d", hex_or_bin2d(m_value+1, 2));
-		dstate_setinfo("input.voltage.maximum", "%3d", hex_or_bin2d(m_value+3, 2));
-
-		/* - * - * - * - * - * - * - * - * - * - * - * - * - * - * - */
-
+    /* Get temperature and frequency for SMART */
+    if( is_smart_protocol() ) {
 		ret = send_cmd(t_msg, sizeof(t_msg), t_value, sizeof(t_value));
-		dstate_setinfo("ups.debug.T", "%s", hexascdump(t_value+1, 7));
 		if(ret <= 0) {
 			dstate_datastale();
 			usb_comm_fail(ret, "Error reading T value");
 			return;
 		}
 
-		if( tl_model == TRIPP_LITE_SMARTPRO ) {
-			freq = hex2d(t_value + 3, 3);
-			dstate_setinfo("input.frequency", "%.1f", freq / 10.0);
-
-			switch(t_value[6]) {
-				case '1':
-					dstate_setinfo("input.frequency.nominal", "%d", 60);
-					break;
-				case '0':
-					dstate_setinfo("input.frequency.nominal", "%d", 50);
-					break;
-			}
-                }
-
-		if( tl_model == TRIPP_LITE_SMART_0004 ) {
-			freq = hex2d(t_value + 3, 4);
-			dstate_setinfo("input.frequency", "%.1f", freq / 10.0);
-		}
-
-		if( tl_model == TRIPP_LITE_SMART_3005 ) {
-			freq = (t_value[3] << 8) | t_value[4];
-			dstate_setinfo("input.frequency", "%.1f", freq / 10.0);
-
-			dstate_setinfo("ups.temperature", "%d", t_value[1]);
-		} else {
-			/* I'm guessing this is a calibration constant of some sort. */
-			dstate_setinfo("ups.temperature", "%.1f", (unsigned)(hex2d(t_value+1, 2)) * 0.3636 - 21);
-		}
+		decode_t(t_value);
 	}
 
 	/* - * - * - * - * - * - * - * - * - * - * - * - * - * - * - */
 
-	if( tl_model == TRIPP_LITE_OMNIVS || tl_model == TRIPP_LITE_OMNIVS_2001 ||
-	    tl_model == TRIPP_LITE_SMARTPRO || tl_model == TRIPP_LITE_SMART_0004) {
-		/* dq ~= sqrt(dV) is a reasonable approximation
-		 * Results fit well against the discrete function used in the Tripp Lite
-		 * source, but give a continuous result. */
-		if (bv_12V >= V_interval[1])
-			bp = 100;
-		else if (bv_12V <= V_interval[0])
-			bp = 10;
-		else
-			bp = (int)(100*sqrt((bv_12V - V_interval[0])
-						/ (V_interval[1] - V_interval[0])));
-
-		dstate_setinfo("battery.charge",  "%3d", bp);
-	}
-
-	/* - * - * - * - * - * - * - * - * - * - * - * - * - * - * - */
-
-	ret = send_cmd(l_msg, sizeof(l_msg), l_value, sizeof(l_value));
-	if(ret <= 0) {
-		dstate_datastale();
-		usb_comm_fail(ret, "Error reading L value");
-		return;
-	}
-
-	switch(tl_model) {
-		case TRIPP_LITE_OMNIVS:
-		case TRIPP_LITE_OMNIVS_2001:
-			dstate_setinfo("output.voltage", "%.1f", hex2d(l_value+1, 4)/240.0*input_voltage_scaled);
-			break;
-		case TRIPP_LITE_SMARTPRO:
-			dstate_setinfo("ups.load", "%d", hex2d(l_value+1, 2));
-			break;
-		case TRIPP_LITE_SMART_0004:
-			dstate_setinfo("ups.load", "%d", hex2d(l_value+1, 2));
-			dstate_setinfo("ups.debug.L","%s", hexascdump(l_value+1, 7));
-			break;
-        case TRIPP_LITE_SMART_3005:
-			dstate_setinfo("ups.load", "%d", l_value[1]);
-			dstate_setinfo("ups.debug.L","%s", hexascdump(l_value+1, 7));
-		default:
-			dstate_setinfo("ups.debug.L","%s", hexascdump(l_value+1, 7));
-			break;
-	}
-
-	/* - * - * - * - * - * - * - * - * - * - * - * - * - * - * - */
-
-	if(tl_model != TRIPP_LITE_OMNIVS && tl_model != TRIPP_LITE_OMNIVS_2001) {
-		debug_message("D", 2);
-
-		/* We already grabbed these above: */
-		if(tl_model != TRIPP_LITE_SMARTPRO) {
-			debug_message("V", 2); /* Probably not necessary - seems to be static */
-			debug_message("M", 2);
-			debug_message("T", 2);
-			debug_message("P", 2);
-		}
-		/* debug_message("U", 2); */
-	}
+    status_commit();
 
 	dstate_dataok();
 }
@@ -1442,12 +1617,6 @@ void upsdrv_makevartable(void)
 	snprintf(msg, sizeof msg, "Maximum battery voltage, corresponding to 100%% charge (default=%.1f)",
 		MAX_VOLT);
 	addvar(VAR_VALUE, "battery_max", msg);
-
-    snprintf(msg, sizeof msg, "Overrule low battery trigger in case UPS doesn't have it (default = 0)");
-	addvar(VAR_VALUE, "nolowbattery", msg);
-
-    snprintf(msg, sizeof msg, "Set battery.charge treshhold for triggering low battery, requires \"nolowbattery\". (default = 0)");
-	addvar(VAR_VALUE, "shutdowntreshhold", msg);
 
 #if 0
 	snprintf(msg, sizeof msg, "Set start delay, in seconds (default=%d).",
@@ -1526,16 +1695,6 @@ void upsdrv_initups(void)
 	if (value) {
 		V_interval[1] = atof(value);
 		upsdebugx(2, "Setting 'battery_max' to %.g", V_interval[1]);
-	}
-
-	value = getval("nolowbattery");
-	if (value) {
-		no_low_battery = atoi(value);
-	}
-
-    value = getval("shutdowntreshhold");
-	if (value && no_low_battery) {
-		shutdown_treshhold = atoi(value);
 	}
 
 #if 0
